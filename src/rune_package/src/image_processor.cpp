@@ -67,7 +67,6 @@ Mat RuneDetector::findRuneArmor(const Mat&input,const Mat&orig) {
         Point2f rotation_center;
         float radius;
         minEnclosingCircle(all_points, rotation_center, radius);
-        rotation_center.y -= 45;
         circle(result, rotation_center, 8, Scalar(255, 0, 0), -1); 
         putText(result, format("Center: (%.0f,%.0f)", rotation_center.x, rotation_center.y),
                 rotation_center + Point2f(15, -15), FONT_HERSHEY_SIMPLEX, 1, Scalar(255, 0, 0), 2);

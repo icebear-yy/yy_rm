@@ -6,7 +6,7 @@
 class VideoPublisher : public rclcpp::Node {
 public:
     VideoPublisher() : Node("video_publisher") {
-        if (!cap_.open("/mnt/d/yy200/Videos/屏幕录制 2025-03-22 134028.mp4")) {
+        if (!cap_.open("/mnt/d/qq/buff.MP4")) {
             RCLCPP_ERROR(this->get_logger(), "无法打开视频文件！");
             rclcpp::shutdown();
             return;

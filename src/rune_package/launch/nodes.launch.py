@@ -12,5 +12,10 @@ def generate_launch_description():
             package='rune_package',
             executable='video_publisher',
             name='video_publisher'
+        ),
+        Node(
+            package='rune_package',
+            executable='tiaocan_node',
+            name='tiaocan'
         )
     ])
