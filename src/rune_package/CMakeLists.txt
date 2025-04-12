@@ -5,6 +5,7 @@ find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(OpenCV REQUIRED)
+find_package(OpenCV REQUIRED COMPONENTS core highgui imgproc)
 add_executable(video_publisher src/video_publisher.cpp)
 ament_target_dependencies(video_publisher
   rclcpp
@@ -20,23 +21,14 @@ ament_target_dependencies(dafu_node
   cv_bridge
   OpenCV
 )
-add_executable(tiaocan_node   src/tiaocan_node.cpp
-src/image_processor.cpp)
-ament_target_dependencies(tiaocan_node
-rclcpp
-sensor_msgs
-cv_bridge
-OpenCV)
-target_include_directories(tiaocan_node PRIVATE                     # 新增行3
-  ${CMAKE_CURRENT_SOURCE_DIR}/include  
-)
+
 target_include_directories(dafu_node PRIVATE
-  ${CMAKE_CURRENT_SOURCE_DIR}/include  
+  ${CMAKE_CURRENT_SOURCE_DIR}/include
+  ${OpenCV_INCLUDE_DIRS}  
 )
 install(TARGETS
   video_publisher
   dafu_node
-  tiaocan_node
   DESTINATION lib/${PROJECT_NAME}
 )
 

@@ -6,7 +6,7 @@
 class VideoPublisher : public rclcpp::Node {
 public:
     VideoPublisher() : Node("video_publisher") {
-        if (!cap_.open("/mnt/d/qq/buff.MP4")) {
+        if (!cap_.open("/mnt/d/rm能量机关/能量机关视频素材（黑暗环境）/能量机关视频素材（黑暗环境）/关灯-蓝方大能量机关-全激活过程.MP4")) {
             RCLCPP_ERROR(this->get_logger(), "无法打开视频文件！");
             rclcpp::shutdown();
             return;
@@ -33,7 +33,7 @@ private:
             std_msgs::msg::Header(), "bgr8", frame
         ).toImageMsg();
         publisher_->publish(*msg);
-        cv::imshow("Video Frame", frame);
+        // cv::imshow("Video Frame", frame);
         cv::waitKey(1);
     }
 
@@ -48,3 +48,6 @@ int main(int argc, char** argv) {
     rclcpp::spin(node);
     return 0;
 }
+
+
+
