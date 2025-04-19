@@ -73,6 +73,8 @@ Mat RuneDetector::predeal(const Mat& input) {
 
 Mat RuneDetector::findRuneArmor(const Mat& input, const Mat& orig) {
     Mat result = orig.clone();
+    Point2f target_center(-1, -1);  
+
     int roi_margin_x = static_cast<int>(orig.cols * param.roi_margin_ratio);
     int roi_margin_y = static_cast<int>(orig.rows * param.roi_margin_ratio);
     Rect roi_rect(
@@ -80,9 +82,11 @@ Mat RuneDetector::findRuneArmor(const Mat& input, const Mat& orig) {
         orig.cols - 2 * roi_margin_x, orig.rows - 2 * roi_margin_y);
     int bottom_exclude = static_cast<int>(orig.rows * param.bottom_exclude_ratio);
 
-        vector<vector<Point>> contours;
+    vector<vector<Point>> contours;
     findContours(input, contours, RETR_EXTERNAL, CHAIN_APPROX_SIMPLE);
     vector<Point2f> armor_centers;
+    vector<pair<double, Point2f>> area_center_pairs; 
+
     for (const auto& contour : contours) {
         double area = contourArea(contour);
         if (area < param.min_contour_area || area > param.max_contour_area) continue;
@@ -91,56 +95,85 @@ Mat RuneDetector::findRuneArmor(const Mat& input, const Mat& orig) {
         if (rect_ratio < param.min_rect_ratio) continue;
         if (!roi_rect.contains(rect.center)) continue;
         if (rect.center.y > (orig.rows - bottom_exclude)) continue;
+
+        Point2f vertices[4];
+        rect.points(vertices);
+        for (int i = 0; i < 4; ++i) {
+            circle(result, vertices[i], 3, Scalar(0, 0, 255), -1);
+            putText(result, 
+                format("(%.0f,%.0f)", vertices[i].x, vertices[i].y),
+                vertices[i] + Point2f(5, 5),
+                FONT_HERSHEY_PLAIN, 
+                0.8, 
+                Scalar(0, 0, 255),
+                1);
+        }
         armor_centers.push_back(rect.center);
+        area_center_pairs.emplace_back(area, rect.center);
     }
 
-        for (const auto& center : armor_centers) {
+    for (const auto& center : armor_centers) {
         armor_center_trajectory.push_back(center);
         if (armor_center_trajectory.size() > 100) {
             armor_center_trajectory.pop_front();
         }
     }
 
+    //判断是否为目标中心，使用是否有子轮廓
+    vector<vector<Point>> children;
+    vector<Vec4i> hierarchy;
+    findContours(input, children, hierarchy, RETR_CCOMP, CHAIN_APPROX_SIMPLE);
+    for (size_t i = 0; i < children.size(); ++i) {
+        if (hierarchy[i][2] != -1) { 
+            RotatedRect rect = minAreaRect(children[i]);
+            target_center = rect.center;
+            break;
+        }
+    }
+
+
+    if (armor_center_trajectory.size() >= 10 && target_center.x >= 0) {
         Point2f fitted_center;
-    float fitted_radius;
-    if (armor_center_trajectory.size() >= 10) {
+        float fitted_radius;
         fitCircle(armor_center_trajectory, fitted_center, fitted_radius);
         fitted_center_history.push_back(fitted_center);
         if (fitted_center_history.size() > 20) {
             fitted_center_history.pop_front();
         }
+
         Point2f smoothed_center(0, 0);
         for (const auto& center : fitted_center_history) {
             smoothed_center += center;
         }
         smoothed_center.x /= fitted_center_history.size();
         smoothed_center.y /= fitted_center_history.size();
+
         circle(result, smoothed_center, 8, Scalar(0, 255, 255), -1);
         circle(result, smoothed_center, static_cast<int>(fitted_radius), Scalar(0, 255, 255), 2);
         putText(result, format("Smoothed Center: (%.0f,%.0f)", smoothed_center.x, smoothed_center.y),
                 smoothed_center + Point2f(15, -15), FONT_HERSHEY_SIMPLEX, 1, Scalar(0, 255, 255), 2);
 
-        // 预测装甲板未来位置
-        if (!armor_centers.empty()) {
-            Point2f future_position = predictFuturePosition(
-                armor_centers[0], smoothed_center, fitted_radius, 1.0f / (3 * CV_PI), 3.0f); // 10ms = 0.01s
+        Point2f future_position = predictFuturePosition(
+            target_center, smoothed_center, fitted_radius, 1.0f / (3 * CV_PI), 3.0f);
 
-            // 在结果图像上绘制预测位置
-            circle(result, future_position, 5, Scalar(255, 0, 0), -1);
-            putText(result, format("Predicted: (%.0f,%.0f)", future_position.x, future_position.y),
-                    future_position + Point2f(10, -10), FONT_HERSHEY_SIMPLEX, 0.8, Scalar(255, 0, 0), 2);
-        }
+        circle(result, future_position, 5, Scalar(255, 0, 0), -1);
+        putText(result, format("Predicted: (%.0f,%.0f)", future_position.x, future_position.y),
+                future_position + Point2f(10, -10), FONT_HERSHEY_SIMPLEX, 0.8, Scalar(255, 0, 0), 2);
     }
 
-    // 绘制装甲板中心
+    //绘制装甲板中心
     for (const auto& center : armor_centers) {
-        circle(result, center, 5, Scalar(0, 255, 0), -1);
+        bool is_target = norm(center - target_center) < 1e-3;
+        Scalar point_color = is_target ? Scalar(0, 0, 255) : Scalar(0, 255, 0);
+        Scalar text_color  = is_target ? Scalar(0, 0, 255) : Scalar(0, 200, 0);
+        circle(result, center, 5, point_color, -1);
         putText(result, format("(%.0f,%.0f)", center.x, center.y),
-                center + Point2f(10, 5), FONT_HERSHEY_PLAIN, 1.4, Scalar(0, 200, 0), 2);
+                center + Point2f(10, 5), FONT_HERSHEY_PLAIN, 1.4, text_color, 2);
     }
 
     return result;
 }
+
 
 void fitCircle(const std::deque<cv::Point2f>& points, cv::Point2f& center, float& radius) {
     int n = points.size();
@@ -224,8 +257,3 @@ cv::Point2f RuneDetector::predictFuturePosition(const cv::Point2f& current_posit
 
     return cv::Point2f(future_x, future_y);
 }
-
-
-
-
-

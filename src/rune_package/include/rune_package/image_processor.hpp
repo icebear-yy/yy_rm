@@ -11,7 +11,7 @@ public:
         int red_brightness_thresh = 80;
         int blue_color_thresh = 80;
         int red_color_thresh = 70;
-        int morph_size = 3;
+        int morph_size = 1;
         float roi_margin_ratio = 0.1f;
         float bottom_exclude_ratio = 0.3f;
         float min_contour_area = 800.0f;
