@@ -4,6 +4,10 @@
 #include<opencv2/opencv.hpp>
 #include<opencv2/highgui.hpp>
 #include<vector>
+#include<filesystem>
+#include<iomanip>
+#include <chrono>
+#include<sstream>
 #include"rune_package/image_processor.hpp"
 using namespace std;
 using namespace cv;
@@ -131,7 +135,7 @@ Mat RuneDetector::findRuneArmor(const Mat& input, const Mat& orig) {
         }
     }
 
-
+//拟合旋转圆心
     if (armor_center_trajectory.size() >= 10 && target_center.x >= 0) {
         Point2f fitted_center;
         float fitted_radius;
@@ -169,7 +173,7 @@ Mat RuneDetector::findRuneArmor(const Mat& input, const Mat& orig) {
         circle(result, center, 5, point_color, -1);
         putText(result, format("(%.0f,%.0f)", center.x, center.y),
                 center + Point2f(10, 5), FONT_HERSHEY_PLAIN, 1.4, text_color, 2);
-    }
+            }
 
     return result;
 }
