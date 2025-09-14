@@ -6,11 +6,16 @@
 #include <string>
 #include <algorithm>
 #include <filesystem>
+#include <array>                    // 新增
+#include <sensor_msgs/msg/image.hpp> // 新增
+#include <cv_bridge/cv_bridge.h>     // 新增
+#include <opencv2/highgui.hpp>
+#include <deque> // 新增：轨迹与平滑队列
 
 // ======================= 配置参数 =======================
-const std::string ONNX_MODEL_PATH = "/mnt/d/rm能量机关/能量机关数据集/训练/run/exp/weights/best.onnx";
+const std::string ONNX_MODEL_PATH = "/mnt/d/rm能量机关/能量机关数据集/训练/run/exp/weights/best.onnx"; 
 const std::string VIDEO_PATH = "/mnt/d/rm能量机关/能量机关视频素材（黑暗环境）/能量机关视频素材（黑暗环境）/新能量机关_正在激活.mp4";
-const std::string OUTPUT_PATH = "/home/icebear/ros2_ws/output_video1.mp4";
+const std::string WINDOW_NAME = "ONNX Detections"; // 新增窗口名
 
 const int INPUT_SIZE = 640;
 const float CONF_THRESHOLD = 0.4f;
@@ -32,8 +37,62 @@ public:
     OnnxDetectNode() : Node("onnx_detect_node"), initialized_(false) {
         initialize();
     }
+    ~OnnxDetectNode() {
+        cv::destroyAllWindows();
+    }
 
 private:
+    // ====== 新增：拟合圆与预测的辅助方法 ======
+    void fitCircle(const std::deque<cv::Point2f>& points, cv::Point2f& center, float& radius) {
+        int n = static_cast<int>(points.size());
+        if (n < 3) { center = {0,0}; radius = 0; return; }
+        float sum_x=0, sum_y=0, sum_x2=0, sum_y2=0, sum_xy=0, sum_x3=0, sum_y3=0, sum_xy2=0, sum_x2y=0;
+        for (const auto& p : points) {
+            float x=p.x, y=p.y;
+            sum_x+=x; sum_y+=y; sum_x2+=x*x; sum_y2+=y*y; sum_xy+=x*y;
+            sum_x3+=x*x*x; sum_y3+=y*y*y; sum_xy2+=x*y*y; sum_x2y+=x*x*y;
+        }
+        float C = n * sum_x2 - sum_x * sum_x;
+        float D = n * sum_xy - sum_x * sum_y;
+        float E = n * sum_y2 - sum_y * sum_y;
+        float G = 0.5f * (n * (sum_x3 + sum_xy2) - sum_x * (sum_x2 + sum_y2));
+        float H = 0.5f * (n * (sum_y3 + sum_x2y) - sum_y * (sum_x2 + sum_y2));
+        float den = C * E - D * D;
+        if (std::abs(den) < 1e-6f) { center = {0,0}; radius = 0; return; }
+        center.x = (E * G - D * H) / den;
+        center.y = (C * H - D * G) / den;
+        radius = std::sqrt((sum_x2 + sum_y2 - 2 * center.x * sum_x - 2 * center.y * sum_y + n * (center.x * center.x + center.y * center.y)) / n);
+    }
+
+    cv::Point2f predictFuturePosition(const cv::Point2f& current_position,
+                                      const cv::Point2f& center,
+                                      float radius,
+                                      float angular_velocity,
+                                      float delta_time) {
+        // 使用最近两帧判断方向（沿用 image_processor 的写法）
+        if (armor_center_traj_.size() < 2) return current_position;
+        const auto& previous_position = armor_center_traj_[armor_center_traj_.size() - 2];
+
+        float dx1 = current_position.x - center.x;
+        float dy1 = current_position.y - center.y;
+        float dx2 = previous_position.x - center.x;
+        float dy2 = previous_position.y - center.y;
+
+        float angle1 = std::atan2(dy1, dx1);
+        float angle2 = std::atan2(dy2, dx2);
+        float angle_diff = angle1 - angle2;
+        if (angle_diff >  CV_PI) angle_diff -= 2 * CV_PI;
+        if (angle_diff < -CV_PI) angle_diff += 2 * CV_PI;
+        int rotation_direction = (angle_diff > 0) ? 1 : -1;
+
+        float current_angle = angle1;
+        float delta_angle = angular_velocity * delta_time * rotation_direction;
+        float future_angle = current_angle + delta_angle;
+
+        return { center.x + radius * std::cos(future_angle),
+                 center.y + radius * std::sin(future_angle) };
+    }
+
     // 初始化所有资源
     void initialize() {
         RCLCPP_INFO(this->get_logger(), "Initializing ONNX Detection Node...");
@@ -44,46 +103,31 @@ private:
                 RCLCPP_FATAL(this->get_logger(), "ONNX model file not found at: %s", ONNX_MODEL_PATH.c_str());
                 return;
             }
-            if (!std::filesystem::exists(VIDEO_PATH)) {
-                RCLCPP_FATAL(this->get_logger(), "Input video file not found at: %s", VIDEO_PATH.c_str());
-                return;
-            }
 
             // 2. 初始化 ONNX Runtime
             env_ = Ort::Env(ORT_LOGGING_LEVEL_WARNING, "onnx_detect");
             Ort::SessionOptions session_options;
             session_options.SetIntraOpNumThreads(1);
             session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
-
             session_ = Ort::Session(env_, ONNX_MODEL_PATH.c_str(), session_options);
-            
+
             // 获取输入输出名称
             input_name_ = session_.GetInputNameAllocated(0, allocator_).get();
             output_name_ = session_.GetOutputNameAllocated(0, allocator_).get();
             RCLCPP_INFO(this->get_logger(), "Model Loaded. Input: '%s', Output: '%s'", input_name_.c_str(), output_name_.c_str());
 
-            // 3. 初始化视频读写
-            cap_.open(VIDEO_PATH);
-            if (!cap_.isOpened()) {
-                RCLCPP_FATAL(this->get_logger(), "Cannot open video file: %s", VIDEO_PATH.c_str());
-                return;
-            }
-            int width = static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_WIDTH));
-            int height = static_cast<int>(cap_.get(cv::CAP_PROP_FRAME_HEIGHT));
-            double fps = cap_.get(cv::CAP_PROP_FPS);
-            if (fps <= 0) fps = 25.0;
+            // 3. 订阅视频话题（来自 video_publisher）
+            sub_ = this->create_subscription<sensor_msgs::msg::Image>(
+                "video_frames",
+                rclcpp::SensorDataQoS(),
+                std::bind(&OnnxDetectNode::image_callback, this, std::placeholders::_1)
+            );
 
-            out_.open(OUTPUT_PATH, cv::VideoWriter::fourcc('m', 'p', '4', 'v'), fps, cv::Size(width, height));
-            if (!out_.isOpened()) {
-                RCLCPP_FATAL(this->get_logger(), "Cannot create output video file: %s", OUTPUT_PATH.c_str());
-                return;
-            }
-            RCLCPP_INFO(this->get_logger(), "Video I/O initialized. Output will be saved to: %s", OUTPUT_PATH.c_str());
+            // 成功初始化后创建显示窗口
+            cv::namedWindow(WINDOW_NAME, cv::WINDOW_AUTOSIZE);
 
-            // 4. 创建定时器开始处理
             initialized_ = true;
-            timer_ = this->create_wall_timer(std::chrono::milliseconds(1), std::bind(&OnnxDetectNode::process_frame, this));
-            RCLCPP_INFO(this->get_logger(), "Initialization successful. Starting video processing...");
+            RCLCPP_INFO(this->get_logger(), "Initialization successful. Waiting for frames on topic: /video_frames");
 
         } catch (const Ort::Exception& e) {
             RCLCPP_FATAL(this->get_logger(), "ONNX Runtime exception: %s", e.what());
@@ -259,63 +303,135 @@ private:
         return final_dets;
     }
 
-    // 逐帧处理
-    void process_frame() {
+    // 图像回调：从话题接收图像并推理
+    void image_callback(const sensor_msgs::msg::Image::SharedPtr msg) {
         if (!initialized_) return;
 
         cv::Mat frame;
-        if (!cap_.read(frame)) {
-            RCLCPP_INFO(this->get_logger(), "Video processing completed. Output saved to: %s", OUTPUT_PATH.c_str());
-            rclcpp::shutdown();
+        try {
+            frame = cv_bridge::toCvShare(msg, "bgr8")->image.clone();
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(this->get_logger(), "cv_bridge conversion failed: %s", e.what());
             return;
         }
+        if (frame.empty()) return;
 
         auto t_start = std::chrono::high_resolution_clock::now();
 
-        // 1. 预处理
+        // 预处理 + 推理
         std::vector<float> blob;
-        float r;
-        int pad_w, pad_h;
+        float r; int pad_w, pad_h;
         preprocess(frame, blob, r, pad_w, pad_h);
-
-        // 2. 创建输入张量
         std::array<int64_t, 4> input_shape{1, 3, INPUT_SIZE, INPUT_SIZE};
         auto memory_info = Ort::MemoryInfo::CreateCpu(OrtArenaAllocator, OrtMemTypeDefault);
         Ort::Value input_tensor = Ort::Value::CreateTensor<float>(memory_info, blob.data(), blob.size(), input_shape.data(), input_shape.size());
-
-        // 3. 推理
         std::vector<const char*> input_names = {input_name_.c_str()};
         std::vector<const char*> output_names = {output_name_.c_str()};
         auto output_tensors = session_.Run(Ort::RunOptions{nullptr}, input_names.data(), &input_tensor, 1, output_names.data(), 1);
-
         if (output_tensors.empty() || !output_tensors.front().IsTensor()) {
-            RCLCPP_ERROR(this->get_logger(), "Failed to get output tensor from ONNX session.");
+            RCLCPP_ERROR(this->get_logger(), "Failed to get output tensor.");
             return;
         }
-
-        // 4. 后处理
         const float* output_data = output_tensors.front().GetTensorData<float>();
         auto output_shape = output_tensors.front().GetTensorTypeAndShapeInfo().GetShape();
         auto detections = postprocess(output_data, output_shape, r, pad_w, pad_h, frame.size());
 
-        auto t_end = std::chrono::high_resolution_clock::now();
-        float fps_now = 1000.0f / std::chrono::duration<float, std::milli>(t_end - t_start).count();
+        // ====== 新增：从检测结果提取 class0/1/2 的中心点 ======
+        std::vector<cv::Point2f> class01_centers;
+        std::vector<cv::Point2f> class2_centers;
+        int best_idx_01 = -1;
+        float best_score_01 = -1.f;
 
-        // 5. 绘制结果
+        for (size_t i = 0; i < detections.size(); ++i) {
+            const auto& d = detections[i];
+            cv::Point2f c(d.box.x + d.box.width * 0.5f,
+                          d.box.y + d.box.height* 0.5f);
+            if (d.class_id == 0 || d.class_id == 1) {
+                class01_centers.push_back(c);
+                if (d.score > best_score_01) { best_score_01 = d.score; best_idx_01 = static_cast<int>(i); }
+            } else if (d.class_id == 2) {
+                class2_centers.push_back(c);
+            }
+        }
+
+        // 把 class0/1 的中心加入轨迹（符页中心）
+        for (const auto& c : class01_centers) {
+            armor_center_traj_.push_back(c);
+            if (armor_center_traj_.size() > 100) armor_center_traj_.pop_front();
+        }
+
+        // ====== 新增：拟合圆心、与 class2 中心做平均、并预测 ======
+        if (!class01_centers.empty() && armor_center_traj_.size() >= kMinFitPoints_) {
+            cv::Point2f fitted_center;
+            float fitted_radius;
+            fitCircle(armor_center_traj_, fitted_center, fitted_radius);
+
+            // 平滑圆心
+            fitted_center_hist_.push_back(fitted_center);
+            if (fitted_center_hist_.size() > kCenterSmoothLen_) fitted_center_hist_.pop_front();
+
+            cv::Point2f smoothed_center(0.f, 0.f);
+            for (const auto& c : fitted_center_hist_) smoothed_center += c;
+            smoothed_center.x /= static_cast<float>(fitted_center_hist_.size());
+            smoothed_center.y /= static_cast<float>(fitted_center_hist_.size());
+
+            // 计算 class2 的中心平均
+            cv::Point2f class2_avg(0.f, 0.f);
+            if (!class2_centers.empty()) {
+                for (const auto& c : class2_centers) class2_avg += c;
+                class2_avg.x /= static_cast<float>(class2_centers.size());
+                class2_avg.y /= static_cast<float>(class2_centers.size());
+            }
+
+            // 最终旋转中心 = 拟合平滑中心 与 class2 平均中心 的平均（若无 class2，则用平滑中心）
+            cv::Point2f final_center = smoothed_center;
+            if (!class2_centers.empty()) {
+                final_center.x = 0.5f * (smoothed_center.x + class2_avg.x);
+                final_center.y = 0.5f * (smoothed_center.y + class2_avg.y);
+            }
+
+            // 可视化：中心与半径
+            cv::circle(frame, final_center, 8, cv::Scalar(0, 255, 255), -1);
+            cv::circle(frame, final_center, static_cast<int>(fitted_radius), cv::Scalar(0, 255, 255), 2);
+            cv::putText(frame, cv::format("Center:(%.0f,%.0f)", final_center.x, final_center.y),
+                        final_center + cv::Point2f(12, -12), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,255), 2);
+
+            // 选一个当前目标点用于预测：取 class0/1 中分数最高的框中心
+            cv::Point2f target_center = class01_centers.front();
+            if (best_idx_01 >= 0) {
+                const auto& d = detections[best_idx_01];
+                target_center = { d.box.x + d.box.width * 0.5f, d.box.y + d.box.height * 0.5f };
+            }
+
+            // 预测（沿用 image_processor 的参数）
+            float angular_velocity = 1.0f / (3.0f * CV_PI);
+            float delta_time = 3.0f;
+            cv::Point2f future = predictFuturePosition(target_center, final_center, fitted_radius, angular_velocity, delta_time);
+
+            cv::circle(frame, future, 5, cv::Scalar(255, 0, 0), -1);
+            cv::putText(frame, cv::format("Pred:(%.0f,%.0f)", future.x, future.y),
+                        future + cv::Point2f(10, -10), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255,0,0), 2);
+        }
+
+        // ====== 你原有的绘制框与FPS ======
         for (const auto& det : detections) {
             cv::Scalar color = COLORS[det.class_id % COLORS.size()];
             cv::rectangle(frame, det.box, color, 2);
-
             std::string label = CLASS_NAMES[det.class_id] + " " + cv::format("%.2f", det.score);
             int baseline = 0;
             cv::Size text_size = cv::getTextSize(label, cv::FONT_HERSHEY_SIMPLEX, 0.6, 2, &baseline);
-            cv::rectangle(frame, cv::Point(det.box.x, det.box.y - text_size.height - 6), cv::Point(det.box.x + text_size.width + 2, det.box.y), color, -1);
-            cv::putText(frame, label, cv::Point(det.box.x, det.box.y - 4), cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
+            cv::rectangle(frame, {det.box.x, det.box.y - text_size.height - 6},
+                          {det.box.x + text_size.width + 2, det.box.y}, color, -1);
+            cv::putText(frame, label, {det.box.x, det.box.y - 4},
+                        cv::FONT_HERSHEY_SIMPLEX, 0.6, cv::Scalar(255, 255, 255), 1, cv::LINE_AA);
         }
-        cv::putText(frame, cv::format("FPS:%.1f", fps_now), cv::Point(10, 25), cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0, 255, 0), 2);
 
-        // 6. 写入视频
-        out_.write(frame);
+        auto t_end = std::chrono::high_resolution_clock::now();
+        float fps_now = 1000.0f / std::chrono::duration<float, std::milli>(t_end - t_start).count();
+        cv::putText(frame, cv::format("FPS:%.1f", fps_now), {10, 25}, cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0,255,0), 2);
+
+        cv::imshow(WINDOW_NAME, frame);
+        cv::waitKey(1);
     }
 
     // 成员变量
@@ -325,10 +441,13 @@ private:
     Ort::AllocatorWithDefaultOptions allocator_;
     std::string input_name_;
     std::string output_name_;
+    rclcpp::Subscription<sensor_msgs::msg::Image>::SharedPtr sub_;
 
-    cv::VideoCapture cap_;
-    cv::VideoWriter out_;
-    rclcpp::TimerBase::SharedPtr timer_;
+    // ====== 新增：状态（轨迹与平滑） ======
+    std::deque<cv::Point2f> armor_center_traj_;  // class0/1 的中心点轨迹
+    std::deque<cv::Point2f> fitted_center_hist_; // 拟合中心的平滑历史
+    const int kMinFitPoints_ = 10;
+    const int kCenterSmoothLen_ = 20;
 };
 
 // ======================= Main 函数 =======================
