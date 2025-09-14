@@ -13,7 +13,7 @@ using namespace std;
 using namespace cv;
 
 
-
+//接收图像
 void RuneDetector::Params::updateFromTrackbars() {
     static bool trackbars_created = false; 
 
@@ -47,7 +47,7 @@ void RuneDetector::Params::updateFromTrackbars() {
     trackbars_created = true; 
 }
 
-
+//预处理
 Mat RuneDetector::predeal(const Mat& input) {
     Mat color_diff, gray, binary_result;
     vector<Mat> bgr_channels;
@@ -75,6 +75,8 @@ Mat RuneDetector::predeal(const Mat& input) {
     return binary_result;
 }
 
+
+//寻找符页
 Mat RuneDetector::findRuneArmor(const Mat& input, const Mat& orig) {
     Mat result = orig.clone();
     Point2f target_center(-1, -1);  
@@ -178,7 +180,7 @@ Mat RuneDetector::findRuneArmor(const Mat& input, const Mat& orig) {
     return result;
 }
 
-
+//拟合圆心方法
 void fitCircle(const std::deque<cv::Point2f>& points, cv::Point2f& center, float& radius) {
     int n = points.size();
     if (n < 3) {
@@ -216,48 +218,39 @@ void fitCircle(const std::deque<cv::Point2f>& points, cv::Point2f& center, float
 }
 
 
-
+//预测未来位置
 cv::Point2f RuneDetector::predictFuturePosition(const cv::Point2f& current_position, const cv::Point2f& center, float radius, float angular_velocity, float delta_time) {
     // 判断旋转方向
     if (armor_center_trajectory.size() < 2) {
         // 如果轨迹点不足，无法判断方向，直接返回当前点
         return current_position;
     }
-
     // 获取当前点和前一个点
     const cv::Point2f& previous_position = armor_center_trajectory[armor_center_trajectory.size() - 2];
     float dx1 = current_position.x - center.x;
     float dy1 = current_position.y - center.y;
     float dx2 = previous_position.x - center.x;
     float dy2 = previous_position.y - center.y;
-
     // 计算当前点和前一个点的角度
     float angle1 = atan2(dy1, dx1); // 当前点相对于圆心的角度
     float angle2 = atan2(dy2, dx2); // 前一个点相对于圆心的角度
-
     // 计算角度差
     float angle_diff = angle1 - angle2;
-
     // 规范化角度差到 [-π, π]
     if (angle_diff > CV_PI) {
         angle_diff -= 2 * CV_PI;
     } else if (angle_diff < -CV_PI) {
         angle_diff += 2 * CV_PI;
     }
-
     // 判断旋转方向
     int rotation_direction = (angle_diff > 0) ? 1 : -1; // 逆时针为 1，顺时针为 -1
-
     // 计算当前角度
     float current_angle = atan2(dy1, dx1); // 当前角度（弧度）
-
     // 计算未来角度
     float delta_angle = angular_velocity * delta_time * rotation_direction; // 根据方向调整角度变化
     float future_angle = current_angle + delta_angle;
-
     // 计算未来位置
     float future_x = center.x + radius * cos(future_angle);
     float future_y = center.y + radius * sin(future_angle);
-
     return cv::Point2f(future_x, future_y);
 }

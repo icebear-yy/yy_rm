@@ -11,6 +11,7 @@
 #include <cv_bridge/cv_bridge.h>     // 新增
 #include <opencv2/highgui.hpp>
 #include <deque> // 新增：轨迹与平滑队列
+#include <opencv2/video/tracking.hpp>  // 新增：卡尔曼滤波
 
 // ======================= 配置参数 =======================
 const std::string ONNX_MODEL_PATH = "/mnt/d/rm能量机关/能量机关数据集/训练/run/exp/weights/best.onnx"; 
@@ -42,6 +43,119 @@ public:
     }
 
 private:
+    // ===== EKF（CTRV: x=[px,py,v,yaw,yaw_rate]）=====
+    void ekfInit(const cv::Point2f& p, double stamp) {
+        x_ = cv::Mat::zeros(5, 1, CV_32F);
+        x_.at<float>(0) = p.x;  // px
+        x_.at<float>(1) = p.y;  // py
+        x_.at<float>(2) = 0.f;  // v
+        x_.at<float>(3) = 0.f;  // yaw
+        x_.at<float>(4) = 0.f;  // yaw_rate
+
+        P_ = cv::Mat::eye(5, 5, CV_32F);
+        P_.at<float>(2,2) = 10.f;
+        P_.at<float>(3,3) = static_cast<float>(CV_PI*CV_PI);
+        P_.at<float>(4,4) = 1.f;
+
+        Q_ = cv::Mat::zeros(5, 5, CV_32F);
+        Q_.at<float>(0,0) = 1e-2f;
+        Q_.at<float>(1,1) = 1e-2f;
+        Q_.at<float>(2,2) = 5e-2f;
+        Q_.at<float>(3,3) = 1e-3f;
+        Q_.at<float>(4,4) = 1e-3f;
+
+        R_ = cv::Mat::eye(2, 2, CV_32F) * 4.f; // 像素量测噪声
+
+        I5_ = cv::Mat::eye(5, 5, CV_32F);
+        H_  = cv::Mat::zeros(2, 5, CV_32F);
+        H_.at<float>(0,0) = 1.f; // z=[px,py]
+        H_.at<float>(1,1) = 1.f;
+
+        ekf_inited_ = true;
+        last_ekf_stamp_ = stamp;
+    }
+
+    void ekfPredict(double dt) {
+        dt = std::max(1e-3, dt);
+
+        float px = x_.at<float>(0), py = x_.at<float>(1);
+        float v  = x_.at<float>(2), th = x_.at<float>(3), w = x_.at<float>(4);
+
+        // 非线性状态更新 f(x)
+        const float eps = 1e-3f;
+        float px_new, py_new;
+        float th_new = th + w * static_cast<float>(dt);
+        if (std::fabs(w) > eps) {
+            float th_dt = th + w*static_cast<float>(dt);
+            px_new = px + v/w * (std::sin(th_dt) - std::sin(th));
+            py_new = py + v/w * (-std::cos(th_dt) + std::cos(th));
+        } else {
+            px_new = px + v*static_cast<float>(dt) * std::cos(th);
+            py_new = py + v*static_cast<float>(dt) * std::sin(th);
+        }
+        x_.at<float>(0) = px_new;
+        x_.at<float>(1) = py_new;
+        x_.at<float>(2) = v;
+        x_.at<float>(3) = th_new;
+        x_.at<float>(4) = w;
+
+        // 雅可比 F
+        cv::Mat F = cv::Mat::eye(5, 5, CV_32F);
+        if (std::fabs(w) > eps) {
+            float th_dt = th + w*static_cast<float>(dt);
+            float s_th = std::sin(th), c_th = std::cos(th);
+            float s_td = std::sin(th_dt), c_td = std::cos(th_dt);
+            F.at<float>(0,2) = (s_td - s_th) / w;
+            F.at<float>(0,3) = v/w * (c_td - c_th);
+            F.at<float>(0,4) = -v/(w*w)*(s_td - s_th) + v/w*(static_cast<float>(dt)*c_td);
+            F.at<float>(1,2) = (-c_td + c_th) / w;
+            F.at<float>(1,3) = v/w * (s_td - s_th);
+            F.at<float>(1,4) = -v/(w*w)*(-c_td + c_th) + v/w*(static_cast<float>(dt)*s_td);
+            F.at<float>(3,4) = static_cast<float>(dt);
+        } else {
+            F.at<float>(0,2) = static_cast<float>(dt) * std::cos(th);
+            F.at<float>(0,3) = -v * static_cast<float>(dt) * std::sin(th);
+            F.at<float>(1,2) = static_cast<float>(dt) * std::sin(th);
+            F.at<float>(1,3) =  v * static_cast<float>(dt) * std::cos(th);
+            F.at<float>(3,4) = static_cast<float>(dt);
+        }
+
+        cv::Mat Qd = Q_.clone(); Qd *= static_cast<float>(dt);
+        P_ = F * P_ * F.t() + Qd;
+    }
+
+    void ekfCorrect(const cv::Point2f& meas) {
+        cv::Mat z(2,1, CV_32F);
+        z.at<float>(0) = meas.x; z.at<float>(1) = meas.y;
+
+        cv::Mat hx(2,1, CV_32F);
+        hx.at<float>(0) = x_.at<float>(0);
+        hx.at<float>(1) = x_.at<float>(1);
+
+        cv::Mat y = z - hx;
+        cv::Mat S = H_ * P_ * H_.t() + R_;
+        cv::Mat K = P_ * H_.t() * S.inv();
+
+        x_ = x_ + K * y;
+        P_ = (I5_ - K * H_) * P_;
+    }
+
+    cv::Point2f ekfExtrapolate(float dt_forward) const {
+        float px = x_.at<float>(0), py = x_.at<float>(1);
+        float v  = x_.at<float>(2), th = x_.at<float>(3), w = x_.at<float>(4);
+        const float eps = 1e-3f;
+        if (std::fabs(w) > eps) {
+            float th_dt = th + w*dt_forward;
+            float px2 = px + v/w * (std::sin(th_dt) - std::sin(th));
+            float py2 = py + v/w * (-std::cos(th_dt) + std::cos(th));
+            return {px2, py2};
+        } else {
+            float px2 = px + v*dt_forward*std::cos(th);
+            float py2 = py + v*dt_forward*std::sin(th);
+            return {px2, py2};
+        }
+    }
+
     // ====== 新增：拟合圆与预测的辅助方法 ======
     void fitCircle(const std::deque<cv::Point2f>& points, cv::Point2f& center, float& radius) {
         int n = static_cast<int>(points.size());
@@ -316,6 +430,16 @@ private:
         }
         if (frame.empty()) return;
 
+        // 计算时间戳（优先用消息时间，否则用墙钟）
+        double stamp_sec = 0.0;
+        if (msg->header.stamp.sec != 0 || msg->header.stamp.nanosec != 0) {
+            stamp_sec = static_cast<double>(msg->header.stamp.sec) +
+                        static_cast<double>(msg->header.stamp.nanosec) * 1e-9;
+        } else {
+            static const auto t0 = std::chrono::steady_clock::now();
+            stamp_sec = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
+        }
+
         auto t_start = std::chrono::high_resolution_clock::now();
 
         // 预处理 + 推理
@@ -357,25 +481,27 @@ private:
         // 把 class0/1 的中心加入轨迹（符页中心）
         for (const auto& c : class01_centers) {
             armor_center_traj_.push_back(c);
-            if (armor_center_traj_.size() > 100) armor_center_traj_.pop_front();
+            if (armor_center_traj_.size() > static_cast<size_t>(100)) armor_center_traj_.pop_front();
         }
 
-        // ====== 新增：拟合圆心、与 class2 中心做平均、并预测 ======
-        if (!class01_centers.empty() && armor_center_traj_.size() >= kMinFitPoints_) {
+        // ====== 拟合圆心、与 class2 中心做平均 ======
+        cv::Point2f final_center;
+        float fitted_radius = 0.f;
+        bool center_ready = false;
+
+        if (!class01_centers.empty() && armor_center_traj_.size() >= static_cast<size_t>(kMinFitPoints_)) {
             cv::Point2f fitted_center;
-            float fitted_radius;
             fitCircle(armor_center_traj_, fitted_center, fitted_radius);
 
             // 平滑圆心
             fitted_center_hist_.push_back(fitted_center);
-            if (fitted_center_hist_.size() > kCenterSmoothLen_) fitted_center_hist_.pop_front();
-
+            if (fitted_center_hist_.size() > static_cast<size_t>(kCenterSmoothLen_)) fitted_center_hist_.pop_front();
             cv::Point2f smoothed_center(0.f, 0.f);
             for (const auto& c : fitted_center_hist_) smoothed_center += c;
             smoothed_center.x /= static_cast<float>(fitted_center_hist_.size());
             smoothed_center.y /= static_cast<float>(fitted_center_hist_.size());
 
-            // 计算 class2 的中心平均
+            // class2 平均中心
             cv::Point2f class2_avg(0.f, 0.f);
             if (!class2_centers.empty()) {
                 for (const auto& c : class2_centers) class2_avg += c;
@@ -383,30 +509,90 @@ private:
                 class2_avg.y /= static_cast<float>(class2_centers.size());
             }
 
-            // 最终旋转中心 = 拟合平滑中心 与 class2 平均中心 的平均（若无 class2，则用平滑中心）
-            cv::Point2f final_center = smoothed_center;
+            // 最终旋转中心
+            final_center = smoothed_center;
             if (!class2_centers.empty()) {
                 final_center.x = 0.5f * (smoothed_center.x + class2_avg.x);
                 final_center.y = 0.5f * (smoothed_center.y + class2_avg.y);
             }
+            center_ready = true;
 
-            // 可视化：中心与半径
+            // 可视化
             cv::circle(frame, final_center, 8, cv::Scalar(0, 255, 255), -1);
             cv::circle(frame, final_center, static_cast<int>(fitted_radius), cv::Scalar(0, 255, 255), 2);
             cv::putText(frame, cv::format("Center:(%.0f,%.0f)", final_center.x, final_center.y),
                         final_center + cv::Point2f(12, -12), cv::FONT_HERSHEY_SIMPLEX, 0.7, cv::Scalar(0,255,255), 2);
+        }
 
-            // 选一个当前目标点用于预测：取 class0/1 中分数最高的框中心
-            cv::Point2f target_center = class01_centers.front();
+        // 选择当前用于预测的目标点（class0/1 里分数最高）
+        cv::Point2f target_center;
+        bool has_target = false;
+        if (!class01_centers.empty()) {
+            target_center = class01_centers.front();
             if (best_idx_01 >= 0) {
                 const auto& d = detections[best_idx_01];
                 target_center = { d.box.x + d.box.width * 0.5f, d.box.y + d.box.height * 0.5f };
             }
+            has_target = true;
+        }
 
-            // 预测（沿用 image_processor 的参数）
-            float angular_velocity = 1.0f / (3.0f * CV_PI);
+        // ====== 新增：角速度稳定性判断 + EKF 分支 ======
+        std::string mode_tag = "little";
+        cv::Point2f future = target_center;
+
+        if (center_ready && has_target) {
+            // 更新角速度历史（用相邻两帧的夹角/时间）
+            if (prev_target_valid_) {
+                double dt = std::max(1e-3, stamp_sec - prev_stamp_);
+                // 相对旋转中心的角度
+                auto angle_of = [&](const cv::Point2f& p) {
+                    return std::atan2(p.y - final_center.y, p.x - final_center.x);
+                };
+                float a_now = angle_of(target_center);
+                float a_pre = angle_of(prev_target_);
+                float da = a_now - a_pre;
+                if (da >  CV_PI) da -= 2.f * CV_PI;
+                if (da < -CV_PI) da += 2.f * CV_PI;
+                float omega = static_cast<float>(std::fabs(da / dt));
+                omega_hist_.push_back(omega);
+                if (omega_hist_.size() > static_cast<size_t>(kOmegaWindow_)) omega_hist_.pop_front();
+            }
+            prev_target_ = target_center;
+            prev_stamp_ = stamp_sec;
+            prev_target_valid_ = true;
+
+            // 统计稳定性（样本不足视为不稳定）
+            bool stable = false;
+            float omega_mean = 0.f, omega_std = 0.f;
+            if (omega_hist_.size() >= static_cast<size_t>(kMinOmegaSamples_)) {
+                for (float v : omega_hist_) omega_mean += v;
+                omega_mean /= static_cast<float>(omega_hist_.size());
+                float var = 0.f;
+                for (float v : omega_hist_) { float d = v - omega_mean; var += d*d; }
+                var /= static_cast<float>(omega_hist_.size());
+                omega_std = std::sqrt(var);
+                if (omega_mean > 1e-6f && (omega_std/omega_mean) <= 0.10f) stable = true;
+            }
+
             float delta_time = 3.0f;
-            cv::Point2f future = predictFuturePosition(target_center, final_center, fitted_radius, angular_velocity, delta_time);
+
+            if (stable) {
+                float angular_velocity = (omega_mean > 0.f) ? omega_mean : (1.0f / (3.0f * CV_PI));
+                future = predictFuturePosition(target_center, final_center, fitted_radius, angular_velocity, delta_time);
+                mode_tag = "little";
+            } else {
+                // === 使用 EKF 代替原 KF ===
+                if (!ekf_inited_) {
+                    ekfInit(target_center, stamp_sec);
+                } else {
+                    double dt = std::max(1e-3, stamp_sec - last_ekf_stamp_);
+                    ekfPredict(dt);
+                    ekfCorrect(target_center);
+                    last_ekf_stamp_ = stamp_sec;
+                }
+                future = ekfExtrapolate(delta_time);
+                mode_tag = "big";
+            }
 
             cv::circle(frame, future, 5, cv::Scalar(255, 0, 0), -1);
             cv::putText(frame, cv::format("Pred:(%.0f,%.0f)", future.x, future.y),
@@ -430,6 +616,14 @@ private:
         float fps_now = 1000.0f / std::chrono::duration<float, std::milli>(t_end - t_start).count();
         cv::putText(frame, cv::format("FPS:%.1f", fps_now), {10, 25}, cv::FONT_HERSHEY_SIMPLEX, 0.75, cv::Scalar(0,255,0), 2);
 
+        // 右上角标注模式：little/big
+        std::string tag_text = "mode: " + mode_tag;
+        int base = 0;
+        cv::Size ts = cv::getTextSize(tag_text, cv::FONT_HERSHEY_SIMPLEX, 0.8, 2, &base);
+        cv::Point org(frame.cols - ts.width - 12, 30);
+        cv::putText(frame, tag_text, org, cv::FONT_HERSHEY_SIMPLEX, 0.8,
+                    (mode_tag == "big") ? cv::Scalar(0,0,255) : cv::Scalar(0,255,0), 2);
+
         cv::imshow(WINDOW_NAME, frame);
         cv::waitKey(1);
     }
@@ -448,6 +642,24 @@ private:
     std::deque<cv::Point2f> fitted_center_hist_; // 拟合中心的平滑历史
     const int kMinFitPoints_ = 10;
     const int kCenterSmoothLen_ = 20;
+
+    // ====== 新增：角速度稳定性判断与卡尔曼滤波 ======
+    cv::Point2f prev_target_{0.f, 0.f};
+    bool prev_target_valid_ = false;
+    double prev_stamp_ = 0.0;
+
+    std::deque<float> omega_hist_;
+    const int kOmegaWindow_ = 15;
+    const int kMinOmegaSamples_ = 5;
+
+    // ===== 删除旧 KF 成员，改为 EKF 成员 =====
+    // cv::KalmanFilter kf_{4,2};
+    // bool kf_inited_ = false;
+    // double last_kf_stamp_ = 0.0;
+
+    bool ekf_inited_ = false;
+    double last_ekf_stamp_ = 0.0;
+    cv::Mat x_, P_, Q_, R_, I5_, H_;
 };
 
 // ======================= Main 函数 =======================

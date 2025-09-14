@@ -6,7 +6,7 @@
 class VideoPublisher : public rclcpp::Node {
 public:
     VideoPublisher() : Node("video_publisher") {
-        if (!cap_.open("/mnt/d/rm能量机关/能量机关视频素材（黑暗环境）/能量机关视频素材（黑暗环境）/关灯-蓝方小能量机关-正在激活状态.MP4")) {
+        if (!cap_.open("/mnt/d/rm能量机关/能量机关视频素材（黑暗环境）/能量机关视频素材（黑暗环境）/新能量机关_正在激活.mp4")) {
             RCLCPP_ERROR(this->get_logger(), "无法打开视频文件！");
             rclcpp::shutdown();
             return;

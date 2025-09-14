@@ -13,9 +13,14 @@ def generate_launch_description():
             executable='video_publisher',
             name='video_publisher'
         ),
+        # Node(
+        #     package='rune_package',
+        #     executable='tiaocan_node',
+        #     name='tiaocan'
+        # ),
         Node(
             package='rune_package',
-            executable='tiaocan_node',
-            name='tiaocan'
+            executable='onnx_detect',
+            name='onnx_detect'
         )
     ])
